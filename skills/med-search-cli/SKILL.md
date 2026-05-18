@@ -28,6 +28,10 @@ triggers:
 
 # Med Search CLI
 
+Two versions: `med_search_cli.py` (stable v1) and `med_search_cli_v2.py` (v2 with date filtering, batch fetch, sort control, study-type filtering, citation metadata, interleaved merge). Both at `/home/peter/`. **Prefer v2** for all new work — same cache DB, backward compatible output, richer metadata.
+
+# Med Search CLI
+
 Single-script twin-track parallel PubMed + EuropePMC CLI at `/home/peter/med_search_cli.py`. Designed for token-efficient AI agent consumption — smart truncation preserves semantically dense content, study types are auto-tagged, and cache + FTS5 eliminate redundant network calls.
 
 ## Commands
@@ -35,29 +39,48 @@ Single-script twin-track parallel PubMed + EuropePMC CLI at `/home/peter/med_sea
 ### search — Find papers
 
 ```bash
-python3 /home/peter/med_search_cli.py search --query "metformin diabetes RCT" --max-results 5
+python3 /home/peter/med_search_cli_v2.py search --query "metformin diabetes RCT" --max-results 5
 ```
 
 - Queries PubMed and EuropePMC in parallel, deduplicates by PMID.
-- Each result: `pmid`, `title`, `date`, `source` (one of `pubmed`, `europepmc`, `both`).
-- `study_type` is `"Unknown"` at search stage — run `fetch` to enrich it.
+- Interleaved merge: "both" sources first, then zigzag PubMed/EuropePMC so both sources are represented.
+- Each result: `pmid`, `title`, `date`, `abstract`, `journal`, `cited_by`, `authors`, `mesh_keywords`, `source`, `study_type`.
+- `study_type` is detected at search time via regex on title+abstract (no fetch needed).
+- `cited_by` comes from EuropePMC; `null` for PubMed-only results.
+
+**v2 search flags:**
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--query` / `-q` | required | Search query; if it contains `[MeSH]`, `[TIAB]`, `AND`/`OR`/`NOT` → passed verbatim to PubMed |
+| `--max-results` / `-m` | `5` | Maximum results to return |
+| `--from-date` / `-f` | none | Lower bound YYYY-MM-DD |
+| `--to-date` / `-t` | none | Upper bound YYYY-MM-DD |
+| `--sort` / `-S` | `relevance` | `relevance`, `date`, or `citations` (EuropePMC only) |
+| `--min-citations` / `-C` | `0` | Minimum citation count filter |
+| `--study-type` / `-T` | none | Single study type filter (RCT, Meta-Analysis, etc.) |
+| `--study-types` / `-U` | none | Comma-separated study types (e.g., `"RCT,Meta-Analysis"`) |
 
 ### fetch — Get full paper data
 
 ```bash
-python3 /home/peter/med_search_cli.py fetch --pmid 38261728 --section all --limit 6000 --ttl 30
+# Single PMID (backward compatible)
+python3 /home/peter/med_search_cli_v2.py fetch --pmid 38261728 --section all --limit 6000 --ttl 30
+
+# Batch fetch multiple PMIDs
+python3 /home/peter/med_search_cli_v2.py fetch --pmid "38261728,38182299,38693734" --limit 3000
 ```
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--pmid` / `-p` | required | PubMed ID |
+| `--pmid` / `-p` | required | Single PMID or comma-separated list for batch fetch |
 | `--section` / `-s` | `all` | One of: `all`, `abstract`, `intro`, `methods`, `results`, `discussion` |
 | `--limit` / `-l` | `6000` | Character limit; triggers smart truncation when exceeded |
 | `--ttl` | `30` | Cache freshness in days (`7` for fast-moving topics, `90` for stable) |
 
-**Full-text resolution order:** PubMed Central Open Access XML → EuropePMC structured text → Unpaywall OA PDF link → fallback (abstract only).
+**Full-text resolution order:** PubMed Central Open Access XML → EuropePMC JATS XML → Unpaywall OA PDF link → fallback (abstract only).
 
-**Output fields:** `pmid`, `title`, `source`, `section`, `study_type`, `text`, plus `doi`, `proxy_url`, `pdf` (when available), `truncated`, `truncated_bytes`, `stale` (cache flag).
+**Output fields:** `pmid`, `title`, `source`, `section`, `study_type`, `text`, plus `doi`, `journal`, `authors`, `mesh_keywords`, `cached`/`cached_stale`, `proxy_url`, `pdf` (when available), `truncated`, `truncated_bytes`.
 
 ### cache-stats — Inspect local cache
 
@@ -121,12 +144,15 @@ All HTTP calls go through exponential backoff with jitter (4 attempts, 0s → 1s
 
 ## Routing rules
 
-- **Literature search for a clinical question:** `search` first, shortlist relevant PMIDs, then `fetch` each one.
-- **Need study type context:** Always `fetch` — study type tagging only runs during full metadata resolution.
-- **Need full-text sections (methods/results):** `fetch --section all` — PMC Open Access XML is parsed into intro/methods/results/discussion sections when available.
+- **Literature search for a clinical question:** `search` first, shortlist relevant PMIDs, then `fetch` each one (batch if multiple).
+- **Need recent papers:** Use `--from-date` + `--to-date` + `-S date` in v2 search. No more stuffing dates into query strings.
+- **Need only guidelines/RCTs/meta-analyses:** Use `--study-type` or `--study-types` filter in v2 search. Study type is now detected at search time.
+- **Need high-impact papers:** Use `--min-citations N` to filter by citation count (EuropePMC data).
+- **Need full-text sections (methods/results):** `fetch --section all` — PMC Open Access XML and EuropePMC JATS XML are parsed into intro/methods/results/discussion sections when available.
 - **Checking if you already have a paper:** `search-cache --query "keyword"` first before hitting the network.
 - **Fast-moving topic (last 7 days):** `fetch --ttl 7` to force cache turnover.
-- **Citation chaining:** Search once, `fetch` each candidate. The cache means subsequent fetches on related papers may hit locally.
+- **Citation chaining:** Search once, `fetch` each candidate. Use batch fetch for efficiency. The cache means subsequent fetches on related papers may hit locally.
+- **PubMed expert query:** Use `[MeSH]`, `[TIAB]`, `AND`/`OR`/`NOT` directly in the query — v2 passes them verbatim to PubMed.
 
 ## Anti-patterns
 
