@@ -517,6 +517,8 @@ def pmid_metadata(pmid: str) -> dict | None:
     doi = getattr(art, "doi", None)
     title = getattr(art, "title", "Untitled")
     abstract = getattr(art, "abstract", "No abstract available")
+    pub_date = getattr(art, "publication_date", None)
+    date_str = str(pub_date) if pub_date else None
 
     mesh_types: list[str] = []
     xml_str = None
@@ -532,11 +534,14 @@ def pmid_metadata(pmid: str) -> dict | None:
         pass
 
     study_type = detect_study_type(title, abstract, mesh_types)
+    is_commentary = bool(set(mesh_types or []) & {"Editorial", "Comment", "Letter", "Published Erratum"})
     return {
         "doi": doi,
         "title": title,
         "abstract": abstract,
+        "date": date_str,
         "study_type": study_type,
+        "commentary": is_commentary,
         "journal": getattr(art, "journal", None),
         "authors": _extract_authors_pubmed(getattr(art, "authors", None)),
         "mesh_keywords": _extract_mesh_pubmed(xml_str if isinstance(xml_str, str) else None),
@@ -759,18 +764,11 @@ def fetch_europepmc_fulltext(pmid: str) -> dict | None:
             if secs:
                 return {"sections": secs}
 
-    # Step 3: fallback — check if abstract has structural labels
-    abstract = paper.get("abstractText", "")
-    if abstract and ("METHODS" in abstract or "RESULTS" in abstract):
-        return {
-            "sections": {
-                "abstract": abstract,
-                "intro": "See abstract.",
-                "methods": "Structural text chunk: " + abstract,
-                "results": "Structural text chunk: " + abstract,
-                "discussion": "Refer to publisher web.",
-            }
-        }
+    # Step 3: fallback — return the abstract as-is. Do NOT fabricate fake
+    # intro/methods/results sections by duplicating it.
+    abstract = paper.get("abstractText", "") or ""
+    if abstract:
+        return {"sections": {"abstract": abstract}}
     return None
 
 
@@ -874,12 +872,20 @@ def _refresh_cache(pmid: str, ttl: int) -> None:
 # ---------------------------------------------------------------------------
 def _fetch_one_pmid(pmid: str, section: str, limit: int, ttl: int) -> dict:
     """Fetch a single PMID, returning a JSON-serializable dict."""
-    cached = get_cached_data(pmid)
+    cached = get_cached_data(pmid) if ttl > 0 else None
 
     if cached and not cached["stale"]:
         out = cached["data"]
         source = cached["source"]
         out["cached"] = True
+        # Legacy cache entries (pre-date-field fix) lack date/commentary —
+        # patch them once from metadata and re-save.
+        if out.get("date") is None:
+            meta = pmid_metadata(pmid)
+            if meta:
+                out["date"] = meta.get("date")
+                out.setdefault("commentary", meta.get("commentary", False))
+                save_to_cache(pmid, source, out, ttl)
     elif cached and cached["stale"]:
         out = cached["data"]
         source = cached["source"]
@@ -896,7 +902,9 @@ def _fetch_one_pmid(pmid: str, section: str, limit: int, ttl: int) -> dict:
             "doi": doi,
             "title": meta["title"],
             "abstract": meta["abstract"],
+            "date": meta.get("date"),
             "study_type": meta.get("study_type", "Unknown"),
+            "commentary": meta.get("commentary", False),
             "sections": None,
             "open_access": None,
             "proxy_url": None,
@@ -939,10 +947,13 @@ def _fetch_one_pmid(pmid: str, section: str, limit: int, ttl: int) -> dict:
     resp: dict = {
         "pmid": pmid,
         "title": out["title"],
+        "date": out.get("date"),
         "source": source,
         "section": section,
         "study_type": out.get("study_type", "Unknown"),
     }
+    if out.get("commentary"):
+        resp["note"] = "Editorial/letter/commentary — no abstract available"
     for optional in ("doi", "journal", "authors", "mesh_keywords", "proxy_url",
                      "cached", "cached_stale"):
         if out.get(optional):
@@ -984,22 +995,26 @@ def _fetch_one_pmid(pmid: str, section: str, limit: int, ttl: int) -> dict:
             section_bonus = sec_bonus_map.get(section, 0)
             raw = secs[section]
         else:
-            raw = f"Section '{section}' not available."
+            raw = ""
+            resp["note"] = f"Section '{section}' not available"
             if out.get("open_access"):
                 resp["pdf"] = out["open_access"]["pdf"]
 
     # Smart truncation with position bonus
-    if raw and len(raw) > limit:
-        keywords = _tokenize(f"{out.get('title', '')} {out.get('abstract', '')}")
-        trimmed, was_truncated, kept_bytes = smart_truncate(
-            raw, limit, keywords, section_bonus=section_bonus
-        )
-        resp["text"] = trimmed
-        resp["truncated"] = was_truncated
-        if was_truncated:
-            resp["truncated_bytes"] = kept_bytes
-    else:
-        resp["text"] = raw
+    if raw:
+        if len(raw) > limit:
+            keywords = _tokenize(f"{out.get('title', '')} {out.get('abstract', '')}")
+            trimmed, was_truncated, kept_bytes = smart_truncate(
+                raw, limit, keywords, section_bonus=section_bonus
+            )
+            resp["text"] = trimmed
+            resp["truncated"] = was_truncated
+            if was_truncated:
+                resp["truncated_bytes"] = kept_bytes
+        else:
+            resp["text"] = raw
+    elif "note" not in resp:
+        resp["note"] = "No text available for this article (no abstract, no OA full text)"
 
     return resp
 

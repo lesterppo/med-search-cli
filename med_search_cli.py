@@ -333,10 +333,20 @@ def _pubmed_client() -> pymed.PubMed:
 
 def search_pubmed(query: str, max_results: int) -> list[dict]:
     pubmed = _pubmed_client()
-    optimized = " AND ".join(f'"{kw}"[TIAB]' for kw in query.split())
+    q = query.strip()
+    # Pass through queries that already use PubMed syntax (field tags, boolean
+    # operators, date ranges). Only plain keyword strings get TIAB-optimized.
+    has_syntax = bool(re.search(r"\[[A-Za-z]{2,6}\]", q)) or bool(
+        re.search(r"\b(AND|OR|NOT)\b", q)
+    )
+    optimized = q if has_syntax else " AND ".join(f'"{kw}"[TIAB]' for kw in q.split())
     try:
         results = pubmed.query(optimized, max_results=max_results)
-    except Exception:
+    except Exception as exc:
+        click.echo(
+            json.dumps({"warn": f"pubmed track failed: {exc}"}, separators=(",", ":")),
+            err=True,
+        )
         return []
     articles: list[dict] = []
     for art in results:
@@ -396,6 +406,9 @@ def pmid_metadata(pmid: str) -> dict | None:
     doi = getattr(art, "doi", None)
     title = getattr(art, "title", "Untitled")
     abstract = getattr(art, "abstract", "No abstract available")
+    # Publication date: prefer the article's own date, then fallbacks
+    pub_date = getattr(art, "publication_date", None)
+    date_str = str(pub_date) if pub_date else None
     # Attempt to extract MeSH publication types from the XML representation
     mesh_types: list[str] = []
     try:
@@ -409,11 +422,16 @@ def pmid_metadata(pmid: str) -> dict | None:
     except Exception:
         pass
     study_type = detect_study_type(title, abstract, mesh_types)
+    # MeSH PublicationType tags are authoritative — also use them to flag
+    # editorials/letters, which have no abstract and need a clear signal.
+    is_commentary = bool(set(mesh_types or []) & {"Editorial", "Comment", "Letter", "Published Erratum"})
     return {
         "doi": doi,
         "title": title,
         "abstract": abstract,
+        "date": date_str,
         "study_type": study_type,
+        "commentary": is_commentary,
     }
 
 
@@ -494,17 +512,11 @@ def fetch_europepmc_fulltext(pmid: str) -> dict | None:
     if not results:
         return None
     paper = results[0]
-    abstract = paper.get("abstractText", "")
-    if "METHODS" in abstract or "RESULTS" in abstract:
-        return {
-            "sections": {
-                "abstract": abstract,
-                "intro": "See abstract.",
-                "methods": "Structural text chunk: " + abstract,
-                "results": "Structural text chunk: " + abstract,
-                "discussion": "Refer to publisher web.",
-            }
-        }
+    abstract = paper.get("abstractText", "") or ""
+    if abstract:
+        # Return the abstract as-is. Do NOT fabricate fake intro/methods/results
+        # sections by duplicating it — that misleads downstream consumers.
+        return {"sections": {"abstract": abstract}}
     return None
 
 
@@ -582,11 +594,19 @@ def search_cmd(query: str, max_results: int) -> None:
 @click.option("--ttl", default=DEFAULT_TTL_DAYS, type=int, help="Cache TTL in days")
 def fetch_cmd(pmid: str, section: str, limit: int, ttl: int) -> None:
     """Fetch a paper by PMID, with twin-track full-text and smart truncation."""
-    # 1. Try cache
-    cached = get_cached_data(pmid)
+    # 1. Try cache — ttl=0 forces a network refresh
+    cached = get_cached_data(pmid) if ttl > 0 else None
     if cached and not cached["stale"]:
         out = cached["data"]
         source = cached["source"]
+        # Legacy cache entries (pre-date-field fix) lack date/commentary —
+        # patch them once from metadata and re-save.
+        if out.get("date") is None:
+            meta = pmid_metadata(pmid)
+            if meta:
+                out["date"] = meta.get("date")
+                out.setdefault("commentary", meta.get("commentary", False))
+                save_to_cache(pmid, source, out, ttl)
     else:
         # 2. Resolve metadata
         meta = pmid_metadata(pmid)
@@ -601,7 +621,9 @@ def fetch_cmd(pmid: str, section: str, limit: int, ttl: int) -> None:
             "doi": doi,
             "title": meta["title"],
             "abstract": meta["abstract"],
+            "date": meta.get("date"),
             "study_type": meta.get("study_type", "Unknown"),
+            "commentary": meta.get("commentary", False),
             "sections": None,
             "open_access": None,
             "proxy_url": None,
@@ -643,46 +665,64 @@ def fetch_cmd(pmid: str, section: str, limit: int, ttl: int) -> None:
     resp: dict = {
         "pmid": pmid,
         "title": out["title"],
+        "date": out.get("date"),
         "source": source,
         "section": section,
         "study_type": out.get("study_type", "Unknown"),
     }
+    if out.get("commentary"):
+        resp["note"] = "Editorial/letter/commentary — no abstract available"
     if out.get("proxy_url"):
         resp["proxy_url"] = out["proxy_url"]
     if cached and cached.get("stale"):
         resp["stale"] = True
 
-    # 6. Select text
+    # 6. Select text. Sections are returned as a structured dict (truncated
+    #    per-field) so smart-truncate never corrupts JSON structure.
     raw: str = ""
     if section == "abstract":
-        raw = out.get("abstract", "")
+        raw = out.get("abstract", "") or ""
+        if raw == "No abstract available":
+            raw = ""
     elif section == "all":
         secs = out.get("sections")
         if secs:
-            raw = json.dumps(secs, ensure_ascii=False, separators=(",", ":"))
+            trimmed_secs: dict[str, str] = {}
+            keywords = _tokenize(f"{out.get('title', '')} {out.get('abstract', '')}")
+            for k, v in secs.items():
+                if isinstance(v, str) and len(v) > limit:
+                    t, _, _ = smart_truncate(v, limit, keywords)
+                    trimmed_secs[k] = t
+                else:
+                    trimmed_secs[k] = v
+            resp["sections"] = trimmed_secs
         else:
-            raw = out.get("abstract", "")
-            if not secs and out.get("open_access"):
+            raw = out.get("abstract", "") or ""
+            if not raw and out.get("open_access"):
                 resp["pdf"] = out["open_access"]["pdf"]
     else:
         secs = out.get("sections")
         if secs and section in secs:
             raw = secs[section]
         else:
-            raw = f"Section '{section}' not available."
+            raw = ""
+            resp["note"] = f"Section '{section}' not available"
             if out.get("open_access"):
                 resp["pdf"] = out["open_access"]["pdf"]
 
-    # 7. Smart truncation
-    if raw and len(raw) > limit:
-        keywords = _tokenize(f"{out.get('title', '')} {out.get('abstract', '')}")
-        trimmed, was_truncated, kept_bytes = smart_truncate(raw, limit, keywords)
-        resp["text"] = trimmed
-        resp["truncated"] = was_truncated
-        if was_truncated:
-            resp["truncated_bytes"] = kept_bytes
-    else:
-        resp["text"] = raw
+    # 7. Smart truncation (plain-text paths only)
+    if raw:
+        if len(raw) > limit:
+            keywords = _tokenize(f"{out.get('title', '')} {out.get('abstract', '')}")
+            trimmed, was_truncated, kept_bytes = smart_truncate(raw, limit, keywords)
+            resp["text"] = trimmed
+            resp["truncated"] = was_truncated
+            if was_truncated:
+                resp["truncated_bytes"] = kept_bytes
+        else:
+            resp["text"] = raw
+    elif "sections" not in resp and "note" not in resp:
+        resp["note"] = "No text available for this article (no abstract, no OA full text)"
 
     click.echo(json.dumps(resp, ensure_ascii=False, separators=(",", ":")))
 
