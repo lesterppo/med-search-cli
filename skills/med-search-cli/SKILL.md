@@ -28,11 +28,11 @@ triggers:
 
 # Med Search CLI
 
-Two versions: `med_search_cli.py` (stable v1) and `med_search_cli_v2.py` (v2 with date filtering, batch fetch, sort control, study-type filtering, citation metadata, interleaved merge). Both at `/home/peter/`. **Prefer v2** for all new work — same cache DB, backward compatible output, richer metadata.
+Two versions: `med_search_cli.py` (stable v1) and `med_search_cli_v2.py` (v2 with date filtering, batch fetch, sort control, study-type filtering, citation metadata, interleaved merge). Canonical location: `/home/peter/med-search-cli/`. **Prefer v2** for all new work — same cache DB, backward compatible output, richer metadata.
 
 # Med Search CLI
 
-Single-script twin-track parallel PubMed + EuropePMC CLI at `/home/peter/med_search_cli.py`. Designed for token-efficient AI agent consumption — smart truncation preserves semantically dense content, study types are auto-tagged, and cache + FTS5 eliminate redundant network calls.
+Single-script twin-track parallel PubMed + EuropePMC CLI at `/home/peter/med-search-cli/med_search_cli.py`. Designed for token-efficient AI agent consumption — smart truncation preserves semantically dense content, study types are auto-tagged, and cache + FTS5 eliminate redundant network calls.
 
 ## Commands
 
@@ -80,7 +80,14 @@ python3 /home/peter/med_search_cli_v2.py fetch --pmid "38261728,38182299,3869373
 
 **Full-text resolution order:** PubMed Central Open Access XML → EuropePMC JATS XML → Unpaywall OA PDF link → fallback (abstract only).
 
-**Output fields:** `pmid`, `title`, `source`, `section`, `study_type`, `text`, plus `doi`, `journal`, `authors`, `mesh_keywords`, `cached`/`cached_stale`, `proxy_url`, `pdf` (when available), `truncated`, `truncated_bytes`.
+**Output fields:** `pmid`, `title`, `date`, `source`, `section`, `study_type`, plus `doi`, `journal`, `authors`, `mesh_keywords`, `cached`/`cached_stale`, `proxy_url`, `pdf` (when available), `truncated`, `truncated_bytes`.
+
+**Output contract (fixed 2026-08):**
+- `date` is always populated (PubMed publication date).
+- Queries containing PubMed field tags (`[TIAB]`, `[dp]`, `[MeSH]`) or boolean operators pass through verbatim — date ranges like `2026/06:2026/08[dp]` work.
+- When no text can be resolved (commentaries, letters, paywalled editorials), `text` is absent and a `note` field explains why. Check for `note` before assuming failure.
+- EuropePMC full-text returns only a real `abstract` section — it never fabricates intro/methods/results.
+- `--ttl 0` forces a network refresh; legacy cache entries self-heal missing `date` on first hit.
 
 ### cache-stats — Inspect local cache
 
