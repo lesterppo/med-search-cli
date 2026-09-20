@@ -61,6 +61,8 @@ med() { python3 ~/med-search-cli/med_search_cli.py "$@"; }
 | What it cites | `refs -p 38261728 -m 20` |
 | Reference manager export | `export -p "1,2,3" -F bibtex -o refs.bib` |
 | PRISMA screening sheet | `export -p "1,2,3" -F csv --screen -o screen.csv` |
+| Dual-reviewer agreement | `reconcile screen.csv` (`-F text` for prose) |
+| Risk-of-bias judgement | `rob -p 38261728 --tool rob2 -d D1=low -d D2=low --overall low --note "..."` (`rob -p 38261728` gets, `rob --list` lists) |
 | Trial registry leg | `trials -q "resmetirom MASH" -s RECRUITING --full` |
 | PRISMA flow (local state) | `prisma -n gave --screened 20 --eligible 5 --included 3` (`-F text` for prose) |
 | "What's new on my topic?" | `watch -n gave -q "gastric antral vascular ectasia"` |
@@ -134,9 +136,17 @@ med citedby -p 34003330 -m 20      # check what has challenged it since
 med search -q "predictive factors gastric antral vascular ectasia" -m 50 -S date > hits.json
 med export -p "$(python3 -c "import json;print(','.join(r['pmid'] for r in json.load(open('hits.json'))))")" \
     -F csv --screen -o screen.csv   # --screen is csv-only (other formats exit 2);
-                                    # adds blank included/reason columns alongside
-                                    # pmid/title/journal/date/study_type/doi/warning/authors
-# flow counts from local state only (watch baseline + cache join; CSVs never parsed)
+                                    # blank dual columns include_a/reason_a (reviewer A)
+                                    # + include_b/reason_b (reviewer B) + consensus/notes,
+                                    # alongside pmid/title/journal/date/study_type/doi/
+                                    # warning/authors; rob_tool/rob_overall fill from
+                                    # stored `rob` judgements, blank when absent
+# reviewers screen independently, resolve consensus, then:
+med reconcile screen.csv            # n, agree %, unweighted Cohen's κ, disagreement PMIDs
+med rob -p <pmid> --tool rob2 -d D1=low -d D2=low --overall low --note "..."
+                                    # tools: rob2|robins-i|nos|quadas-2; overall:
+                                    # low|some-concerns|high|critical; bad values exit 2
+# flow counts from local state only (only reconcile parses screening CSVs)
 med prisma -n gave --screened 20 --eligible 5 --included 3
 med prisma -F text                  # all saved queries, prose form; honest zeros when empty
 # snowball
@@ -175,12 +185,14 @@ NLM MeSH lookup, OpenAlex (reference-list fallback), ClinicalTrials.gov v2.
   the cache stores one entry per paper; slice locally instead.
 * **Do not expect full text for every paper** (~⅓ PMC OA coverage). `source`
   tells you what resolved: `pubmed_ft`, `europepmc_ft`, `unpaywall`, `fallback`.
-* **Do not treat this as a PRISMA engine** — `export --screen` produces the
-  screening sheet and `prisma` reports flow counts from existing local state
+* **Do not treat this as a full PRISMA engine** — `export --screen` produces
+  the dual-reviewer screening sheet, `reconcile` reports agreement (it is the
+  only command that parses screening CSVs), `rob` stores risk-of-bias
+  judgements (surfaced as `rob_tool`/`rob_overall` in later `--screen`
+  exports), and `prisma` reports flow counts from existing local state
   (watch baseline + cache join: identified/cached/fulltext/with-abstract/
   no-text) plus your own `--screened/--eligible/--included` tallies. It never
-  parses screening CSVs and never invents records — not risk-of-bias
-  judgements.
+  invents records.
 * **`citedby` separates identity from provenance.** Each hit carries `pmid`
   (set only when `source` is `MED` — EPMC/preprint IDs never land there),
   plus raw `id`/`source` fields. `-S citations` keeps input order: citation

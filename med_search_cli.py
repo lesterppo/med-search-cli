@@ -519,6 +519,16 @@ def init_db() -> None:
             tokenize='porter'
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS rob (
+            pmid TEXT PRIMARY KEY,
+            tool TEXT,
+            domains TEXT,
+            overall TEXT,
+            note TEXT,
+            updated TEXT
+        )"""
+    )
     conn.commit()
     conn.close()
 
@@ -2037,8 +2047,13 @@ def _refs_openalex(pmid: str, max_results: int, degraded: str | None) -> tuple[l
 def export_cmd(pmids: str, fmt: str, out: str | None, screen: bool) -> None:
     """Export records for a reference manager (BibTeX/RIS/CSV/JSON).
 
-    The screened CSV adds blank include/exclude/reason columns plus the
-    fields a PRISMA flow diagram needs, so screening can start immediately.
+    The screened CSV adds blank dual-reviewer columns plus the fields a
+    PRISMA flow diagram needs, so screening can start immediately.
+    A/B independent-screen workflow: reviewer A fills include_a/reason_a,
+    reviewer B fills include_b/reason_b, then consensus/notes are resolved
+    together and checked with `reconcile`. rob_tool/rob_overall are filled
+    from local risk-of-bias judgements (`rob` command) when present, blank
+    otherwise.
     """
     ids = [_require_pmid(p) for p in pmids.split(",") if p.strip()]
     if not ids:
@@ -2065,9 +2080,6 @@ def export_cmd(pmids: str, fmt: str, out: str | None, screen: bool) -> None:
         r["mesh"] = meta.get("mesh_keywords") or []
         if meta.get("retracted"):
             r["warning"] = "RETRACTED"
-        if screen:
-            r["included"] = ""
-            r["reason"] = ""
         records.append(r)
 
     if fmt == "json":
@@ -2076,13 +2088,24 @@ def export_cmd(pmids: str, fmt: str, out: str | None, screen: bool) -> None:
         import csv as _csv
         import io as _io
         buf = _io.StringIO()
+        screen_fields = (["include_a", "reason_a", "include_b", "reason_b",
+                          "consensus", "notes", "rob_tool", "rob_overall"]
+                         if screen else [])
         fields = ["pmid", "title", "journal", "date", "study_type", "doi", "warning",
-                  "authors"] + (["included", "reason"] if screen else [])
+                  "authors"] + screen_fields
         w = _csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
+        rob_map = _rob_lookup([r.get("pmid") for r in records]) if screen else {}
         for r in records:
             row = dict(r)
             row["authors"] = "; ".join(r.get("authors") or [])
+            if screen:
+                for c in ("include_a", "reason_a", "include_b", "reason_b",
+                          "consensus", "notes"):
+                    row.setdefault(c, "")
+                hit = rob_map.get(r.get("pmid") or "")
+                row["rob_tool"] = (hit or {}).get("tool", "")
+                row["rob_overall"] = (hit or {}).get("overall", "")
             w.writerow({k: row.get(k, "") for k in fields})
         text = buf.getvalue()
     elif fmt == "ris":
@@ -2131,6 +2154,302 @@ def export_cmd(pmids: str, fmt: str, out: str | None, screen: bool) -> None:
                               separators=(",", ":")))
     else:
         click.echo(text)
+
+
+# ---------------------------------------------------------------------------
+# Dual-reviewer screening (reconcile) + risk-of-bias (rob)
+# ---------------------------------------------------------------------------
+_ROB_TOOLS = ("rob2", "robins-i", "nos", "quadas-2")
+_ROB_OVERALLS = ("low", "some-concerns", "high", "critical")
+
+_INCLUDE_YES = {"yes", "y", "1", "true", "t", "include", "included", "in"}
+_INCLUDE_NO = {"no", "n", "0", "false", "f", "exclude", "excluded", "ex", "out"}
+
+
+def _ensure_rob_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS rob (
+            pmid TEXT PRIMARY KEY,
+            tool TEXT,
+            domains TEXT,
+            overall TEXT,
+            note TEXT,
+            updated TEXT
+        )"""
+    )
+    conn.commit()
+
+
+def _rob_lookup(pmids: list) -> dict:
+    """Return {pmid: {"tool": ..., "overall": ...}} for stored RoB judgements."""
+    ids = [p for p in (pmids or []) if p]
+    if not ids:
+        return {}
+    conn = _connect()
+    _ensure_rob_table(conn)
+    out: dict = {}
+    try:
+        q = f"SELECT pmid, tool, overall FROM rob WHERE pmid IN ({','.join('?' * len(ids))})"
+        for pmid, tool, overall in conn.execute(q, ids).fetchall():
+            out[pmid] = {"tool": tool or "", "overall": overall or ""}
+    finally:
+        conn.close()
+    return out
+
+
+def _rob_get(pmid: str) -> dict | None:
+    conn = _connect()
+    _ensure_rob_table(conn)
+    try:
+        row = conn.execute(
+            "SELECT pmid, tool, domains, overall, note, updated FROM rob WHERE pmid=?",
+            (pmid,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        domains = json.loads(row[2]) if row[2] else {}
+    except (json.JSONDecodeError, TypeError):
+        domains = {}
+    return {"pmid": row[0], "tool": row[1], "domains": domains,
+            "overall": row[3], "note": row[4] or "", "updated": row[5] or ""}
+
+
+def _parse_include(value) -> bool | None:
+    """Parse an include_a/include_b cell: True/False/None(blank).
+
+    Accepts yes/no/1/0 (plus y/n, true/false, include/exclude variants,
+    case-insensitive). Raises ValueError on anything else.
+    """
+    s = (value or "").strip().lower() if isinstance(value, str) else str(value).strip().lower()
+    if not s:
+        return None
+    if s in _INCLUDE_YES:
+        return True
+    if s in _INCLUDE_NO:
+        return False
+    raise ValueError(f"Unrecognised include value {value!r}: use yes/no/1/0")
+
+
+def unweighted_kappa(pairs: list) -> float:
+    """Cohen's kappa (unweighted) over [(a_bool, b_bool), ...]. Stdlib only."""
+    n = len(pairs)
+    if not n:
+        return 0.0
+    agree = sum(1 for a, b in pairs if a == b)
+    po = agree / n
+    pa_yes = sum(1 for a, _b in pairs if a) / n
+    pb_yes = sum(1 for _a, b in pairs if b) / n
+    pe = pa_yes * pb_yes + (1 - pa_yes) * (1 - pb_yes)
+    if abs(1 - pe) < 1e-12:
+        return 1.0 if agree == n else 0.0
+    return (po - pe) / (1 - pe)
+
+
+@cli.command("reconcile")
+@click.argument("csv_path", required=False, default=None)
+@click.option("--csv", "-c", "csv_opt", default=None, help="Filled screening CSV path")
+@click.option("--format", "-F", "fmt",
+              type=click.Choice(["json", "text"]), default="json")
+def reconcile_cmd(csv_path: str | None, csv_opt: str | None, fmt: str) -> None:
+    """Agreement stats for a dual-reviewed screening CSV.
+
+    Reads a filled `export --screen` CSV (include_a/include_b as yes/no/1/0)
+    and reports n, agreement %, unweighted Cohen's kappa and the PMID list
+    reviewers disagreed on. Rows where either reviewer left the cell blank
+    are skipped (reported as `skipped`).
+    """
+    path = (csv_opt or csv_path or "").strip()
+    if not path:
+        click.echo(json.dumps(
+            {"error": "no CSV given: reconcile FILE or reconcile --csv FILE"},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        click.echo(json.dumps({"error": f"CSV not found: {path}"},
+                              separators=(",", ":")), err=True)
+        sys.exit(2)
+    import csv as _csv
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = _csv.DictReader(fh)
+        if not reader.fieldnames:
+            click.echo(json.dumps({"error": f"CSV has no header: {path}"},
+                                  separators=(",", ":")), err=True)
+            sys.exit(2)
+        lower = {c.strip().lower(): c for c in reader.fieldnames}
+        missing = [c for c in ("pmid", "include_a", "include_b") if c not in lower]
+        if missing:
+            click.echo(json.dumps(
+                {"error": f"CSV missing columns: {', '.join(missing)}"},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
+        c_pmid, c_a, c_b = lower["pmid"], lower["include_a"], lower["include_b"]
+        pairs: list = []
+        disagreements: list = []
+        skipped = 0
+        for i, row in enumerate(reader, start=2):
+            pmid = (row.get(c_pmid) or "").strip()
+            try:
+                a = _parse_include(row.get(c_a))
+                b = _parse_include(row.get(c_b))
+            except ValueError as exc:
+                click.echo(json.dumps(
+                    {"error": f"row {i} (pmid {pmid or '?'}): {exc}"},
+                    separators=(",", ":")), err=True)
+                sys.exit(2)
+            if a is None or b is None:
+                skipped += 1
+                continue
+            pairs.append((a, b))
+            if a != b and pmid:
+                disagreements.append(pmid)
+    n = len(pairs)
+    agree = sum(1 for a, b in pairs if a == b)
+    payload = {
+        "n": n,
+        "agree": agree,
+        "disagree": n - agree,
+        "agree_pct": round(agree / n * 100, 1) if n else 0.0,
+        "kappa": round(unweighted_kappa(pairs), 4) if n else 0.0,
+        "disagreements": disagreements,
+        "skipped": skipped,
+    }
+    if fmt == "text":
+        lines = [
+            f"Reconciliation: n={n} judged, agree={agree}, "
+            f"disagree={n - agree} ({payload['agree_pct']}%), "
+            f"kappa={payload['kappa']}, skipped={skipped}",
+            ("Disagreements: " + (", ".join(disagreements) if disagreements
+                                  else "none")),
+        ]
+        click.echo("\n".join(lines))
+    else:
+        click.echo(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+@cli.command("rob")
+@click.option("--pmid", "-p", default=None, help="PMID to get/upsert")
+@click.option("--tool", "tool_name", default=None,
+              help="RoB tool: rob2|robins-i|nos|quadas-2")
+@click.option("--domain", "-d", "domains", multiple=True,
+              help="Domain judgement K=V (repeatable, e.g. -d D1=low)")
+@click.option("--overall", default=None,
+              help="Overall judgement: low|some-concerns|high|critical")
+@click.option("--note", default=None, help="Free-text note")
+@click.option("--list", "-l", "list_only", is_flag=True, default=False,
+              help="List all stored judgements")
+@click.option("--format", "-F", "fmt",
+              type=click.Choice(["json", "text"]), default="json")
+def rob_cmd(pmid: str | None, tool_name: str | None, domains: tuple,
+            overall: str | None, note: str | None,
+            list_only: bool, fmt: str) -> None:
+    """Store or fetch risk-of-bias judgements (local SQLite `rob` table).
+
+    Upsert: `rob -p PMID --tool rob2 -d D1=low -d D2=low --overall low
+    --note "..."`. Get: `rob -p PMID`. List: `rob --list`.
+    `export --screen` CSVs pick up rob_tool/rob_overall automatically.
+    """
+    init_db()
+    conn = _connect()
+    _ensure_rob_table(conn)
+
+    def _emit(obj) -> None:
+        if fmt == "text":
+            if isinstance(obj, list):
+                for r in obj:
+                    click.echo(f"{r['pmid']} [{r['tool']}] {r['overall']} "
+                               f"{json.dumps(r['domains'], ensure_ascii=False)}"
+                               + (f" — {r['note']}" if r.get("note") else ""))
+                if not obj:
+                    click.echo("No risk-of-bias judgements stored.")
+            else:
+                click.echo(f"{obj['pmid']} [{obj['tool']}] {obj['overall']} "
+                           f"{json.dumps(obj['domains'], ensure_ascii=False)}"
+                           + (f" — {obj['note']}" if obj.get("note") else ""))
+        else:
+            click.echo(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+
+    if list_only:
+        rows = conn.execute(
+            "SELECT pmid, tool, domains, overall, note, updated FROM rob ORDER BY pmid"
+        ).fetchall()
+        conn.close()
+        out = []
+        for r in rows:
+            try:
+                doms = json.loads(r[2]) if r[2] else {}
+            except (json.JSONDecodeError, TypeError):
+                doms = {}
+            out.append({"pmid": r[0], "tool": r[1], "domains": doms,
+                        "overall": r[3], "note": r[4] or "", "updated": r[5] or ""})
+        if fmt == "text":
+            _emit(out)
+        else:
+            _emit({"n": len(out), "r": out})
+        return
+    conn.close()
+
+    if not pmid:
+        click.echo(json.dumps({"error": "rob needs -p PMID or --list"},
+                              separators=(",", ":")), err=True)
+        sys.exit(2)
+    clean = _require_pmid(pmid)
+    wants_write = (tool_name is not None or overall is not None
+                   or bool(domains) or note is not None)
+    if not wants_write:
+        rec = _rob_get(clean)
+        if rec is None:
+            click.echo(json.dumps({"error": f"no RoB judgement for PMID {clean}"},
+                                  separators=(",", ":")), err=True)
+            sys.exit(1)
+        _emit(rec)
+        return
+
+    tool = (tool_name or "").strip().lower()
+    ov = (overall or "").strip().lower()
+    if tool not in _ROB_TOOLS:
+        click.echo(json.dumps(
+            {"error": f"bad --tool {tool_name!r}: use one of {', '.join(_ROB_TOOLS)}"},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
+    if ov not in _ROB_OVERALLS:
+        click.echo(json.dumps(
+            {"error": f"bad --overall {overall!r}: use one of {', '.join(_ROB_OVERALLS)}"},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
+    new_domains: dict = {}
+    for d in domains:
+        if "=" not in d:
+            click.echo(json.dumps(
+                {"error": f"bad --domain {d!r}: use K=V (e.g. -d D1=low)"},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
+        k, v = d.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k or not v:
+            click.echo(json.dumps(
+                {"error": f"bad --domain {d!r}: use K=V (e.g. -d D1=low)"},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
+        new_domains[k] = v
+    prev = _rob_get(clean)
+    merged = dict(prev["domains"]) if prev else {}
+    merged.update(new_domains)
+    final_note = note if note is not None else (prev["note"] if prev else "")
+    updated = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO rob (pmid, tool, domains, overall, note, updated)"
+        " VALUES (?,?,?,?,?,?)",
+        (clean, tool, json.dumps(merged, ensure_ascii=False), ov, final_note, updated),
+    )
+    conn.commit()
+    conn.close()
+    _emit({"pmid": clean, "tool": tool, "domains": merged,
+           "overall": ov, "note": final_note, "updated": updated})
 
 
 @cli.command("trials")

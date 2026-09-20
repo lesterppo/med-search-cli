@@ -47,7 +47,9 @@ Fixes (all reproduced live first, then verified after):
 | `related -p <pmid>` | Similar articles (PubMed neighbour links) — snowballing from a seed paper |
 | `citedby -p <pmid>` | Forward citation chasing (EuropePMC citations) — who cites this paper |
 | `refs -p <pmid>` | Backward citation chasing; falls back to OpenAlex when EuropePMC's `/references` returns 503 |
-| `export -p <pmids> -F bibtex\|ris\|csv\|json [-o file]` | Reference-manager export; `--screen` adds PRISMA screening columns |
+| `export -p <pmids> -F bibtex\|ris\|csv\|json [-o file]` | Reference-manager export; `--screen` adds dual-reviewer screening columns (`include_a/reason_a`, `include_b/reason_b`, `consensus`, `notes`) plus `rob_tool`/`rob_overall` from stored RoB judgements |
+| `reconcile FILE\|--csv FILE [-F text]` | Dual-reviewer agreement for a filled `--screen` CSV: n, agree %, unweighted Cohen's κ, disagreement PMIDs |
+| `rob -p <pmid> --tool rob2\|robins-i\|nos\|quadas-2 -d D1=low [--overall low] [--note ...]` | Upsert a risk-of-bias judgement (`rob -p PMID` gets, `rob --list` lists); surfaced in `export --screen` |
 | `trials -q <term> [-s STATUS] [--full]` | ClinicalTrials.gov registry leg of a systematic review (with `totalCount`) |
 | `watch -n <name> -q <query>` | Standing-query surveillance: reports only records not seen before (SQLite-backed baseline) |
 
@@ -150,12 +152,16 @@ cache with FTS5 index, and background refresh of stale entries.
   them, and `-V` reports how many were dropped.
 * `refs` depends on EuropePMC `/references`, which returns 503 during
   maintenance — the OpenAlex fallback keeps backward chasing working.
-* This is a retrieval tool, not a systematic-review platform: no dual
-  screening or risk-of-bias assessment. `export --screen` produces the
-  screening spreadsheet to do that work elsewhere; `prisma` composes the
-  PRISMA-style flow counts from existing local state only (watch baseline
-  + cache join) plus your own --screened/--eligible/--included counts —
-  screening CSVs live outside the DB and are never parsed.
+* This is a retrieval tool with a light systematic-review layer: `export
+  --screen` produces the dual-reviewer screening spreadsheet (reviewer A
+  fills `include_a`/`reason_a`, reviewer B fills `include_b`/`reason_b`,
+  then `consensus`/`notes` are resolved together and `reconcile` reports
+  agreement + Cohen's κ), `rob` stores per-PMID risk-of-bias judgements
+  (RoB 2, ROBINS-I, NOS, QUADAS-2) that reappear as `rob_tool`/`rob_overall`
+  in later `--screen` exports, and `prisma` composes the PRISMA-style flow
+  counts from existing local state only (watch baseline + cache join) plus
+  your own --screened/--eligible/--included counts — screening CSVs live
+  outside the DB and only `reconcile` parses them.
 
 ## AI-agent skill
 
