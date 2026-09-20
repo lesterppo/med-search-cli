@@ -479,7 +479,12 @@ def smart_truncate(text: str, limit: int, keywords: set[str] | None = None,
             truncated = True
             remaining = limit - total - 4
             if remaining > 40:
-                kept.append(s[:remaining] + "...")
+                cut = s[:remaining]
+                # Word-boundary cut: back off to the last space.
+                sp = cut.rfind(" ")
+                if sp > remaining * 0.5:
+                    cut = cut[:sp]
+                kept.append(cut + "...")
             break
 
     result = " ".join(kept)
@@ -527,12 +532,19 @@ def get_cached_data(pmid: str) -> dict | None:
     conn.close()
     if not row:
         return None
-    updated = datetime.fromisoformat(row[2])
+    try:
+        payload = json.loads(row[1])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    try:
+        updated = datetime.fromisoformat(row[2])
+    except (ValueError, TypeError):
+        return None
     ttl_days = row[3] if row[3] is not None else DEFAULT_TTL_DAYS
     age = (datetime.now(timezone.utc).replace(tzinfo=None) - updated.replace(tzinfo=None)).days
     return {
         "source": row[0],
-        "data": json.loads(row[1]),
+        "data": payload,
         "stale": age > ttl_days,
     }
 
@@ -1057,13 +1069,11 @@ def fetch_europepmc_fulltext(pmid: str) -> dict | None:
         if ft_body:
             secs = _parse_europepmc_fulltext_xml(ft_body)
             if secs:
-                return {"sections": secs}
-
-    # Step 3: fallback — return the abstract as-is. Do NOT fabricate fake
-    # intro/methods/results sections by duplicating it.
-    abstract = paper.get("abstractText", "") or ""
-    if abstract:
-        return {"sections": {"abstract": abstract}}
+                body_len = sum(len(v) for v in secs.values() if isinstance(v, str))
+                if body_len >= 200:
+                    return {"sections": secs}
+    # No JATS full text — return None so the caller falls through to the
+    # abstract with text_from=abstract (never claim a *_ft source).
     return None
 
 
@@ -1384,7 +1394,7 @@ def search_cmd(query: str, max_results: int, from_date: str | None,
                                   separators=(",", ":")), err=True)
             sys.exit(2)
 
-        # Validate dates
+        # Validate dates (shape + semantic: datetime.strptime rejects month 13/day 99)
         date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
         for label, val in [("from_date", from_date), ("to_date", to_date)]:
             if val and not date_re.match(val):
@@ -1392,6 +1402,14 @@ def search_cmd(query: str, max_results: int, from_date: str | None,
                     {"error": f"Invalid {label}: '{val}'. Use YYYY-MM-DD."},
                     separators=(",", ":")), err=True)
                 sys.exit(2)
+            if val:
+                try:
+                    datetime.strptime(val, "%Y-%m-%d")
+                except ValueError:
+                    click.echo(json.dumps(
+                        {"error": f"Invalid {label}: '{val}' is not a real calendar date. Use YYYY-MM-DD."},
+                        separators=(",", ":")), err=True)
+                    sys.exit(2)
         if from_date and to_date and from_date > to_date:
             click.echo(json.dumps(
                 {"error": f"from_date {from_date} is after to_date {to_date}"},
@@ -1529,6 +1547,11 @@ def search_cmd(query: str, max_results: int, from_date: str | None,
 def fetch_cmd(pmid: str, section: str, limit: int, ttl: int) -> None:
     """Fetch one or more papers by PMID (comma-separated for batch)."""
     try:
+        if limit <= 0:
+            click.echo(json.dumps(
+                {"error": f"Invalid --limit {limit}: must be a positive character budget."},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
         pmids = [p.strip() for p in pmid.split(",") if p.strip()]
         if not pmids:
             click.echo(json.dumps({"error": "No valid PMIDs provided."},
@@ -1572,6 +1595,7 @@ def fetch_cmd(pmid: str, section: str, limit: int, ttl: int) -> None:
             click.echo(json.dumps(results, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:
         click.echo(json.dumps({"error": str(exc)}, separators=(",", ":")), err=True)
+        sys.exit(1)
 
 
 @cli.command("cache-stats")
@@ -1806,8 +1830,14 @@ def citedby_cmd(pmid: str, max_results: int, sort: str) -> None:
     for c in cites:
         if not isinstance(c, dict):
             continue
+        # Only MED-source citations carry PubMed IDs — EPMC/preprint IDs
+        # must not land in the pmid field.
+        src = (c.get("source") or "").upper()
+        cid = c.get("id")
         out.append({
-            "pmid": c.get("id"),
+            "pmid": cid if src == "MED" else None,
+            "id": cid,
+            "source": c.get("source"),
             "title": c.get("title"),
             "journal": (c.get("journalAbbreviation") or c.get("journalTitle")),
             "year": c.get("pubYear"),
@@ -1816,6 +1846,10 @@ def citedby_cmd(pmid: str, max_results: int, sort: str) -> None:
         })
     if sort == "date":
         out.sort(key=lambda r: (r.get("year") or ""), reverse=True)
+    elif sort == "citations":
+        # citation records carry no citedByCount — keep input order (most
+        # relevant first) instead of pretending to sort.
+        pass
     click.echo(json.dumps({"pmid": pid, "hit_count": data.get("hitCount"),
                            "n": len(out), "r": out},
                           ensure_ascii=False, separators=(",", ":")))
@@ -1862,13 +1896,6 @@ def refs_cmd(pmid: str, max_results: int) -> None:
     # down for maintenance (HTTP 503), so backward chasing needs a second path.
     if not out:
         out, degraded = _refs_openalex(pid, max_results, degraded)
-    if not out:
-        ft = fetch_pubmed_fulltext(pid)
-        refs_text = ((ft or {}).get("sections") or {}).get("references")
-        if refs_text:
-            out = [{"citation": line.strip()} for line in str(refs_text).splitlines()
-                   if line.strip()][:max_results]
-            degraded = (degraded + " " if degraded else "") + "PubMed reference list used."
     if not out:
         click.echo(json.dumps({
             "pmid": pid, "n": 0, "r": [],
@@ -1949,7 +1976,9 @@ def export_cmd(pmids: str, fmt: str, out: str | None, screen: bool) -> None:
         click.echo(json.dumps({"error": "no PMIDs given"}, separators=(",", ":")), err=True)
         sys.exit(2)
     if screen and fmt != "csv":
-        screen = False
+        click.echo(json.dumps({"error": "--screen applies to csv only; rerun with -F csv"},
+                              separators=(",", ":")), err=True)
+        sys.exit(2)
 
     summ = _esummary_batch(ids)
     records: list[dict] = []
@@ -1967,8 +1996,9 @@ def export_cmd(pmids: str, fmt: str, out: str | None, screen: bool) -> None:
         r["mesh"] = meta.get("mesh_keywords") or []
         if meta.get("retracted"):
             r["warning"] = "RETRACTED"
-        r["included"] = ""
-        r["reason"] = ""
+        if screen:
+            r["included"] = ""
+            r["reason"] = ""
         records.append(r)
 
     if fmt == "json":
@@ -1978,7 +2008,7 @@ def export_cmd(pmids: str, fmt: str, out: str | None, screen: bool) -> None:
         import io as _io
         buf = _io.StringIO()
         fields = ["pmid", "title", "journal", "date", "study_type", "doi", "warning",
-                  "authors", "included", "reason"]
+                  "authors"] + (["included", "reason"] if screen else [])
         w = _csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         for r in records:
@@ -2098,7 +2128,7 @@ def trials_cmd(query: str, max_results: int, status: str | None, full: bool) -> 
 
 
 @cli.command("watch")
-@click.option("--name", "-n", required=True, help="Saved query name")
+@click.option("--name", "-n", required=False, default=None, help="Saved query name")
 @click.option("--query", "-q", default=None, help="Set/replace the saved query")
 @click.option("--max-results", "-m", default=20, type=int)
 @click.option("--list", "-L", "list_only", is_flag=True, default=False,
@@ -2128,6 +2158,11 @@ def watch_cmd(name: str, query: str | None, max_results: int,
                                      for r in rows]}, separators=(",", ":")))
         return
 
+    if not name:
+        conn.close()
+        click.echo(json.dumps({"error": "watch requires --name except with --list"},
+                              separators=(",", ":")), err=True)
+        sys.exit(2)
     if forget:
         conn.execute("DELETE FROM saved_queries WHERE name=?", (name,))
         conn.execute("DELETE FROM seen_items WHERE name=?", (name,))
