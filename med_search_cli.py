@@ -17,7 +17,8 @@ v3 changes vs the legacy v2 script
   silently returning unrelated records
 * structured abstract labels preserved (AIMS / METHODS / RESULTS / CONCLUSION)
 * retraction + erratum + expression-of-concern flags on every record
-* new researcher commands: mesh, related, citedby, refs, export, trials, watch
+* new researcher commands: mesh, related, citedby, refs, export, trials, watch,
+  prisma (local-state PRISMA flow counts)
 """
 
 import click
@@ -2323,6 +2324,178 @@ def watch_cmd(name: str, query: str | None, max_results: int,
     if baseline:
         out["note"] = "baseline stored — new records will appear on the next run"
     click.echo(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
+
+
+def _prisma_stats(conn: sqlite3.Connection, name: str) -> dict:
+    """Flow counts for one saved query from local state only.
+
+    identified = rows in seen_items (the watch baseline); cached = those
+    PMIDs also present in lit_cache; fulltext = cached rows whose sections
+    hold >= 200 chars of body (the same bar fetch uses before claiming a
+    *_ft source); with_abstract = cached rows with a non-empty abstract;
+    no_text = cached rows with neither. Screening decisions live in
+    --screen CSVs outside the DB and are never parsed here.
+    """
+    seen = [r[0] for r in conn.execute(
+        "SELECT pmid FROM seen_items WHERE name=?", (name,)).fetchall()]
+    identified = len(seen)
+    cached = fulltext = with_abs = no_text = 0
+    if seen:
+        payloads: dict[str, str] = {}
+        for i in range(0, len(seen), 500):
+            chunk = seen[i:i + 500]
+            q = ",".join("?" * len(chunk))
+            for pmid, payload in conn.execute(
+                    f"SELECT pmid, payload FROM lit_cache WHERE pmid IN ({q})",
+                    chunk).fetchall():
+                payloads[pmid] = payload
+        for pmid in seen:
+            payload = payloads.get(pmid)
+            if payload is None:
+                continue
+            cached += 1
+            try:
+                data = json.loads(payload)
+            except Exception:
+                no_text += 1
+                continue
+            if not isinstance(data, dict):
+                no_text += 1
+                continue
+            has_abs = bool(str(data.get("abstract") or "").strip())
+            secs = data.get("sections")
+            body = (sum(len(v) for v in secs.values() if isinstance(v, str))
+                    if isinstance(secs, dict) else 0)
+            has_ft = body >= 200
+            if has_ft:
+                fulltext += 1
+            if has_abs:
+                with_abs += 1
+            if not has_abs and not has_ft:
+                no_text += 1
+    return {"identified": identified, "cached": cached, "fulltext": fulltext,
+            "with_abstract": with_abs, "no_text": no_text,
+            "uncached": identified - cached}
+
+
+@cli.command("prisma")
+@click.option("--name", "-n", default=None,
+              help="Saved watch-query name (default: all saved queries)")
+@click.option("--screened", default=0, type=int,
+              help="Records you screened (your count from the --screen CSV; CSVs are never parsed)")
+@click.option("--eligible", default=0, type=int,
+              help="Full texts you assessed for eligibility (your count)")
+@click.option("--included", default=0, type=int,
+              help="Studies you included in the review (your count)")
+@click.option("--format", "-F", "fmt",
+              type=click.Choice(["json", "text"]), default="json")
+def prisma_cmd(name: str | None, screened: int, eligible: int, included: int,
+               fmt: str) -> None:
+    """PRISMA-style flow counts from EXISTING local state only.
+
+    Identification/screening-cache numbers come from the watch baseline
+    (seen_items) joined to lit_cache — nothing is fetched, nothing is
+    invented. Screening decisions live in export --screen CSVs outside the
+    DB, so screened/eligible/included are user-supplied counts composed
+    into the flow. Absent state reports honest zeros (exit 0).
+    """
+    for label, val in (("screened", screened), ("eligible", eligible),
+                       ("included", included)):
+        if val < 0:
+            click.echo(json.dumps(
+                {"error": f"Invalid --{label} {val}: must be >= 0."},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
+    init_db()
+    conn = _connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS saved_queries (
+        name TEXT PRIMARY KEY, query TEXT, created TEXT, last_run TEXT,
+        max_results INTEGER)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS seen_items (
+        name TEXT, pmid TEXT, first_seen TEXT, PRIMARY KEY (name, pmid))""")
+    conn.commit()
+
+    if name:
+        row = conn.execute(
+            "SELECT query, last_run FROM saved_queries WHERE name=?",
+            (name,)).fetchone()
+        if not row:
+            conn.close()
+            click.echo(json.dumps(
+                {"error": f"no saved query '{name}' — prisma reads watch state; "
+                          "create it with watch -n NAME -q QUERY first"},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
+        targets = [(name, row[0], row[1])]
+        scope = name
+    else:
+        targets = conn.execute(
+            "SELECT name, query, last_run FROM saved_queries ORDER BY name"
+        ).fetchall()
+        scope = "all"
+
+    queries: list[dict] = []
+    totals = {"identified": 0, "cached": 0, "fulltext": 0,
+              "with_abstract": 0, "no_text": 0, "uncached": 0}
+    for qname, qtext, qlast in targets:
+        st = _prisma_stats(conn, qname)
+        for k in totals:
+            totals[k] += st[k]
+        entry = {"name": qname, "query": qtext, "last_run": qlast, **st}
+        if name:
+            # Single-query scope: user counts belong to this query.
+            entry["screened"] = screened
+            entry["eligible"] = eligible
+            entry["included"] = included
+        else:
+            entry["screened"] = 0
+            entry["eligible"] = 0
+            entry["included"] = 0
+        queries.append(entry)
+    conn.close()
+
+    totals_with_user = dict(totals)
+    totals_with_user["screened"] = screened
+    totals_with_user["eligible"] = eligible
+    totals_with_user["included"] = included
+    note = ("Local state only (seen_items + lit_cache): no network, no invented "
+            "records. screened/eligible/included are user-supplied counts — "
+            "export --screen CSVs live outside the DB and are never parsed.")
+    if not queries:
+        note = ("No saved watch queries in this DB (honest zeros). " + note
+                if scope == "all" else note)
+
+    if fmt == "text":
+        lines = [f"PRISMA 2020 flow — local state only (scope: {scope})"]
+        if not queries:
+            lines.append("No saved watch queries — all counts 0.")
+        for e in queries:
+            lines.append(f"Query '{e['name']}': {e['query'] or ''}"
+                         + (f" (last run {e['last_run']})" if e["last_run"] else " (never run)"))
+            lines.append(f"  Identification: records identified (watch baseline) = {e['identified']}")
+            lines.append(f"  Screening (cache): cached = {e['cached']} "
+                         f"(full text ≥200 chars = {e['fulltext']}, "
+                         f"with abstract = {e['with_abstract']}, "
+                         f"no text = {e['no_text']}, uncached = {e['uncached']})")
+            if name:
+                lines.append(f"  Eligibility (your counts): screened = {e['screened']}, "
+                             f"eligible = {e['eligible']}")
+                lines.append(f"  Included (your count): included = {e['included']}")
+        if scope == "all" and queries:
+            t = totals
+            lines.append(f"Totals: identified = {t['identified']}, cached = {t['cached']} "
+                         f"(full text = {t['fulltext']}, with abstract = {t['with_abstract']}, "
+                         f"no text = {t['no_text']}, uncached = {t['uncached']})")
+            lines.append(f"Eligibility (your counts): screened = {screened}, eligible = {eligible}")
+            lines.append(f"Included (your count): included = {included}")
+        lines.append(f"Note: {note}")
+        click.echo("\n".join(lines))
+        return
+
+    click.echo(json.dumps(
+        {"scope": scope, "n": len(queries), "queries": queries,
+         "totals": totals_with_user, "note": note},
+        ensure_ascii=False, separators=(",", ":")))
 
 
 def _run_search(query: str, max_results: int, from_date: str | None,

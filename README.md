@@ -150,9 +150,12 @@ cache with FTS5 index, and background refresh of stale entries.
   them, and `-V` reports how many were dropped.
 * `refs` depends on EuropePMC `/references`, which returns 503 during
   maintenance — the OpenAlex fallback keeps backward chasing working.
-* This is a retrieval tool, not a systematic-review platform: no PRISMA flow
-  diagram, dual screening, or risk-of-bias assessment. `export --screen`
-  produces the screening spreadsheet to do that work elsewhere.
+* This is a retrieval tool, not a systematic-review platform: no dual
+  screening or risk-of-bias assessment. `export --screen` produces the
+  screening spreadsheet to do that work elsewhere; `prisma` composes the
+  PRISMA-style flow counts from existing local state only (watch baseline
+  + cache join) plus your own --screened/--eligible/--included counts —
+  screening CSVs live outside the DB and are never parsed.
 
 ## AI-agent skill
 

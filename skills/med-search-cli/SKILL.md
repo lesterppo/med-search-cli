@@ -62,6 +62,7 @@ med() { python3 ~/med-search-cli/med_search_cli.py "$@"; }
 | Reference manager export | `export -p "1,2,3" -F bibtex -o refs.bib` |
 | PRISMA screening sheet | `export -p "1,2,3" -F csv --screen -o screen.csv` |
 | Trial registry leg | `trials -q "resmetirom MASH" -s RECRUITING --full` |
+| PRISMA flow (local state) | `prisma -n gave --screened 20 --eligible 5 --included 3` (`-F text` for prose) |
 | "What's new on my topic?" | `watch -n gave -q "gastric antral vascular ectasia"` |
 | Already-cached full text | `search-cache -q "SGLT2 cardiovascular"` |
 | Cache health | `cache-stats` |
@@ -88,7 +89,16 @@ med() { python3 ~/med-search-cli/med_search_cli.py "$@"; }
    the abstract; if a response has neither `text` nor `note`, re-issue with
    `--ttl 0`.
 4. **Exit codes matter.** `2` = your input was invalid (empty query, malformed
-   PMID, reversed date range) — fix the call, do not retry the network.
+   PMID, non-calendar or reversed date range, `--limit`/`--max-results` < 1,
+   `--screen` without `-F csv`, negative `--screened/--eligible/--included`) —
+   fix the call, do not retry the network. `1` = upstream failure (single-PMID
+   `fetch` miss, `citedby`/`trials`/`mesh` request or parse failure).
+5. **Date bounds are semantic.** `search -f/-t` must be real calendar dates
+   (`datetime.strptime` rejects month 13 / day 99) and `-f` must not be after
+   `-t`; violations exit 2.
+6. **`fetch` needs a positive budget.** `--limit` must be > 0 (exit 2
+   otherwise); a single-PMID miss is an upstream error (exit 1 on stderr),
+   not an empty payload.
 
 ## Query construction
 
@@ -123,7 +133,12 @@ med citedby -p 34003330 -m 20      # check what has challenged it since
 ```bash
 med search -q "predictive factors gastric antral vascular ectasia" -m 50 -S date > hits.json
 med export -p "$(python3 -c "import json;print(','.join(r['pmid'] for r in json.load(open('hits.json'))))")" \
-    -F csv --screen -o screen.csv
+    -F csv --screen -o screen.csv   # --screen is csv-only (other formats exit 2);
+                                    # adds blank included/reason columns alongside
+                                    # pmid/title/journal/date/study_type/doi/warning/authors
+# flow counts from local state only (watch baseline + cache join; CSVs never parsed)
+med prisma -n gave --screened 20 --eligible 5 --included 3
+med prisma -F text                  # all saved queries, prose form; honest zeros when empty
 # snowball
 med refs    -p <seed> -m 30
 med citedby -p <seed> -m 30
@@ -134,9 +149,10 @@ med trials  -q "<intervention> <condition>" --full
 
 ```bash
 med watch -n gave -q "gastric antral vascular ectasia" -m 20   # first run = baseline
-med watch -n gave -m 20                                        # later runs: only new records
-med watch -n x --list                                          # saved queries
-med watch -n gave --forget                                     # delete
+med watch -n gave -m 20            # later runs: only new records; explicit -m wins,
+                                   # otherwise the persisted per-query width is reused
+med watch --list                   # saved queries (--list needs no --name)
+med watch -n gave --forget         # delete
 ```
 
 ### Strategy building
@@ -159,5 +175,17 @@ NLM MeSH lookup, OpenAlex (reference-list fallback), ClinicalTrials.gov v2.
   the cache stores one entry per paper; slice locally instead.
 * **Do not expect full text for every paper** (~⅓ PMC OA coverage). `source`
   tells you what resolved: `pubmed_ft`, `europepmc_ft`, `unpaywall`, `fallback`.
-* **Do not treat this as a PRISMA engine** — it produces the screening sheet and
-  the citation graph, not risk-of-bias judgements.
+* **Do not treat this as a PRISMA engine** — `export --screen` produces the
+  screening sheet and `prisma` reports flow counts from existing local state
+  (watch baseline + cache join: identified/cached/fulltext/with-abstract/
+  no-text) plus your own `--screened/--eligible/--included` tallies. It never
+  parses screening CSVs and never invents records — not risk-of-bias
+  judgements.
+* **`citedby` separates identity from provenance.** Each hit carries `pmid`
+  (set only when `source` is `MED` — EPMC/preprint IDs never land there),
+  plus raw `id`/`source` fields. `-S citations` keeps input order: citation
+  records carry no `citedByCount`, so a citation sort would be fiction.
+* **Negative/zero widths are rejected.** Every `--max-results`/`--limit`
+  guard (`search`, `fetch`, `search-cache`, `mesh`, `related`, `citedby`,
+  `refs`, `export` via PMID validation, `trials`, `watch -m`, `prisma`
+  user counts) exits 2 — a bare `-m 0` never silently returns `[]`.
