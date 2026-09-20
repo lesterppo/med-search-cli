@@ -1204,7 +1204,8 @@ def _fetch_one_pmid(pmid: str, section: str, limit: int, ttl: int) -> dict:
     else:
         meta = pmid_metadata(pmid)
         if not meta:
-            return {"error": "Metadata resolution failed.", "pmid": pmid}
+            return {"error": f"No PubMed record found for PMID {pmid} "
+                             f"(invalid or deleted).", "pmid": pmid}
 
         doi = meta["doi"]
         out = {
@@ -1416,6 +1417,28 @@ def search_cmd(query: str, max_results: int, from_date: str | None,
                 separators=(",", ":")), err=True)
             sys.exit(2)
 
+        # Numeric guards: -m 0 silently returned []; -m -5 sliced off the
+        # tail (final[:-5]) yet still hit the network; -C -1 was ignored.
+        if max_results < 1:
+            click.echo(json.dumps(
+                {"error": f"Invalid --max-results {max_results}: must be >= 1."},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
+        if min_citations < 0:
+            click.echo(json.dumps(
+                {"error": f"Invalid --min-citations {min_citations}: must be >= 0."},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
+        if study_types:
+            given = [t.strip() for t in study_types.split(",") if t.strip()]
+            unknown = [t for t in given if t not in _STUDY_TYPE_TAGS]
+            if unknown:
+                click.echo(json.dumps(
+                    {"error": f"Unknown study type(s): {', '.join(unknown)}. "
+                              f"Valid: {', '.join(_STUDY_TYPE_TAGS)}"},
+                    separators=(",", ":")), err=True)
+                sys.exit(2)
+
         # Build study-type filter set
         allowed_types: set[str] | None = None
         if study_type or study_types:
@@ -1552,12 +1575,17 @@ def fetch_cmd(pmid: str, section: str, limit: int, ttl: int) -> None:
                 {"error": f"Invalid --limit {limit}: must be a positive character budget."},
                 separators=(",", ":")), err=True)
             sys.exit(2)
+        if ttl < 0:
+            click.echo(json.dumps(
+                {"error": f"Invalid --ttl {ttl}: must be >= 0 days (0 bypasses cache)."},
+                separators=(",", ":")), err=True)
+            sys.exit(2)
         pmids = [p.strip() for p in pmid.split(",") if p.strip()]
         if not pmids:
             click.echo(json.dumps({"error": "No valid PMIDs provided."},
                                   separators=(",", ":")), err=True)
             sys.exit(2)
-        bad = [p for p in pmids if not re.fullmatch(r"\d{1,9}", p)]
+        bad = [p for p in pmids if not re.fullmatch(r"\d{1,12}", p)]
         if bad:
             click.echo(json.dumps(
                 {"error": f"Invalid PMID(s): {', '.join(bad)} — expected digits only."},
@@ -1570,8 +1598,14 @@ def fetch_cmd(pmid: str, section: str, limit: int, ttl: int) -> None:
             sys.exit(2)
 
         if len(pmids) == 1:
-            # Single PMID — backward-compatible object response
+            # Single PMID — backward-compatible object response.
+            # A resolution failure is an upstream (exit 1) error on stderr,
+            # not a zero-exit payload on stdout.
             result = _fetch_one_pmid(pmids[0], section, limit, ttl)
+            if isinstance(result, dict) and result.get("error"):
+                click.echo(json.dumps(result, ensure_ascii=False,
+                                      separators=(",", ":")), err=True)
+                sys.exit(1)
             click.echo(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         else:
             # Batch — array response
@@ -1610,6 +1644,16 @@ def cache_stats_cmd() -> None:
 @click.option("--limit", "-l", default=20, type=int)
 def search_cache_cmd(query: str, limit: int) -> None:
     """Full-text search across locally cached papers (zero network calls)."""
+    if limit < 1:
+        click.echo(json.dumps(
+            {"error": f"Invalid --limit {limit}: must be >= 1."},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
+    _, qerr = validate_query(query)
+    if qerr:
+        click.echo(json.dumps({"error": qerr, "query": query},
+                              separators=(",", ":")), err=True)
+        sys.exit(2)
     results = search_cache(query, limit)
     click.echo(json.dumps(results, ensure_ascii=False, separators=(",", ":")))
 
@@ -1668,7 +1712,7 @@ def _iso_from_pubdate(pubdate: str) -> str | None:
 def _require_pmid(pmid: str) -> str:
     """Validate a PMID and exit with a clear error otherwise."""
     clean = (pmid or "").strip()
-    if not re.fullmatch(r"\d{1,9}", clean):
+    if not re.fullmatch(r"\d{1,12}", clean):
         click.echo(json.dumps(
             {"error": f"Invalid PMID '{pmid}' — expected digits only (e.g. 38261728)."},
             separators=(",", ":")), err=True)
@@ -1688,6 +1732,15 @@ def mesh_cmd(term: str, limit: int, exact: bool, counts: bool) -> None:
     if err or not clean:
         click.echo(json.dumps({"error": err}, separators=(",", ":")), err=True)
         sys.exit(2)
+    if limit < 1:
+        click.echo(json.dumps(
+            {"error": f"Invalid --limit {limit}: must be >= 1."},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
+    # The NLM lookup endpoint stops responding above ~50 (limit=100/200
+    # yields an empty body → misleading "no response" upstream error).
+    if limit > 50:
+        limit = 50
     match = "exact" if exact else "contains"
     url = (
         "https://id.nlm.nih.gov/mesh/lookup/descriptor"
@@ -1776,6 +1829,11 @@ def mesh_cmd(term: str, limit: int, exact: bool, counts: bool) -> None:
 def related_cmd(pmid: str, max_results: int) -> None:
     """Similar articles (PubMed neighbor links) — snowball from a seed paper."""
     pid = _require_pmid(pmid)
+    if max_results < 1:
+        click.echo(json.dumps(
+            {"error": f"Invalid --max-results {max_results}: must be >= 1."},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
     url = (
         "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi"
         f"?dbfrom=pubmed&db=pubmed&id={pid}&cmd=neighbor&retmode=json"
@@ -1810,6 +1868,11 @@ def related_cmd(pmid: str, max_results: int) -> None:
 def citedby_cmd(pmid: str, max_results: int, sort: str) -> None:
     """Who cites this paper (forward citation chasing / surveillance)."""
     pid = _require_pmid(pmid)
+    if max_results < 1:
+        click.echo(json.dumps(
+            {"error": f"Invalid --max-results {max_results}: must be >= 1."},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
     url = (
         "https://www.ebi.ac.uk/europepmc/webservices/rest/MED/"
         f"{pid}/citations?format=json&pageSize={max_results}"
@@ -1861,6 +1924,11 @@ def citedby_cmd(pmid: str, max_results: int, sort: str) -> None:
 def refs_cmd(pmid: str, max_results: int) -> None:
     """Reference list of a paper (backward citation chasing)."""
     pid = _require_pmid(pmid)
+    if max_results < 1:
+        click.echo(json.dumps(
+            {"error": f"Invalid --max-results {max_results}: must be >= 1."},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
     url = (
         "https://www.ebi.ac.uk/europepmc/webservices/rest/MED/"
         f"{pid}/references?format=json&pageSize={max_results}"
@@ -2002,7 +2070,7 @@ def export_cmd(pmids: str, fmt: str, out: str | None, screen: bool) -> None:
         records.append(r)
 
     if fmt == "json":
-        text = json.dumps(records, ensure_ascii=False, indent=1)
+        text = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
     elif fmt == "csv":
         import csv as _csv
         import io as _io
@@ -2076,9 +2144,22 @@ def trials_cmd(query: str, max_results: int, status: str | None, full: bool) -> 
     if err:
         click.echo(json.dumps({"error": err}, separators=(",", ":")), err=True)
         sys.exit(2)
+    if max_results < 1:
+        click.echo(json.dumps(
+            {"error": f"Invalid --max-results {max_results}: must be >= 1."},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
+    valid_statuses = ("RECRUITING", "ACTIVE_NOT_RECRUITING", "COMPLETED",
+                      "NOT_YET_RECRUITING")
+    if status and status.upper() not in valid_statuses:
+        click.echo(json.dumps(
+            {"error": f"Invalid --status '{status}'. "
+                      f"Valid: {' | '.join(valid_statuses)}"},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
     params = {
         "query.term": clean,
-        "pageSize": min(max(max_results, 1), 50),
+        "pageSize": min(max_results, 50),
         "countTotal": "true",
     }
     if status:
@@ -2130,7 +2211,8 @@ def trials_cmd(query: str, max_results: int, status: str | None, full: bool) -> 
 @cli.command("watch")
 @click.option("--name", "-n", required=False, default=None, help="Saved query name")
 @click.option("--query", "-q", default=None, help="Set/replace the saved query")
-@click.option("--max-results", "-m", default=20, type=int)
+@click.option("--max-results", "-m", default=None, type=int,
+              help="Results per run (persisted with the query; default 20)")
 @click.option("--list", "-L", "list_only", is_flag=True, default=False,
               help="List saved queries instead of running one")
 @click.option("--forget", is_flag=True, default=False, help="Delete a saved query")
@@ -2147,6 +2229,11 @@ def watch_cmd(name: str, query: str | None, max_results: int,
         name TEXT PRIMARY KEY, query TEXT, created TEXT, last_run TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS seen_items (
         name TEXT, pmid TEXT, first_seen TEXT, PRIMARY KEY (name, pmid))""")
+    # Migration: persist per-query max_results (older DBs lack the column).
+    try:
+        conn.execute("ALTER TABLE saved_queries ADD COLUMN max_results INTEGER")
+    except Exception:
+        pass
     conn.commit()
 
     if list_only:
@@ -2171,28 +2258,48 @@ def watch_cmd(name: str, query: str | None, max_results: int,
         click.echo(json.dumps({"forgot": name}, separators=(",", ":")))
         return
 
+    # An explicit -m overrides; otherwise reuse the stored width so repeat
+    # runs check the same pool (previously a create with -m 5 followed by a
+    # bare run silently widened to 20, inflating n_new).
+    explicit_m = max_results is not None
+    if explicit_m and max_results < 1:
+        conn.close()
+        click.echo(json.dumps(
+            {"error": f"Invalid --max-results {max_results}: must be >= 1."},
+            separators=(",", ":")), err=True)
+        sys.exit(2)
+    existing = conn.execute(
+        "SELECT query, max_results FROM saved_queries WHERE name=?", (name,)).fetchone()
+
     if query:
         clean, err = validate_query(query)
         if err:
             conn.close()
             click.echo(json.dumps({"error": err}, separators=(",", ":")), err=True)
             sys.exit(2)
+        run_m = (max_results if explicit_m
+                 else (existing[1] if existing and existing[1] else 20))
         conn.execute(
-            "INSERT INTO saved_queries (name, query, created, last_run) VALUES (?,?,?,?) "
-            "ON CONFLICT(name) DO UPDATE SET query=excluded.query",
-            (name, clean, datetime.now(timezone.utc).isoformat(), None))
+            "INSERT INTO saved_queries (name, query, created, last_run, max_results)"
+            " VALUES (?,?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET query=excluded.query,"
+            " max_results=excluded.max_results",
+            (name, clean, datetime.now(timezone.utc).isoformat(), None, run_m))
         conn.commit()
 
-    row = conn.execute("SELECT query FROM saved_queries WHERE name=?", (name,)).fetchone()
+    row = conn.execute("SELECT query, max_results FROM saved_queries WHERE name=?",
+                       (name,)).fetchone()
     if not row:
         conn.close()
         click.echo(json.dumps({"error": f"no saved query '{name}' — pass -q to create it"},
                               separators=(",", ":")), err=True)
         sys.exit(2)
     stored_query = row[0]
+    run_m = (max_results if explicit_m
+             else (row[1] if row[1] else 20))
 
     # Run the same twin-track search used by `search`.
-    results = _run_search(stored_query, max_results, None, None, "date", 0, None)
+    results = _run_search(stored_query, run_m, None, None, "date", 0, None)
     seen = {r[0] for r in conn.execute(
         "SELECT pmid FROM seen_items WHERE name=?", (name,)).fetchall()}
     new_items = [r for r in results if r.get("pmid") not in seen]
