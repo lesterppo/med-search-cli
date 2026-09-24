@@ -230,15 +230,20 @@ def _retraction_flags(pub_types: list[str] | None, comments=None) -> dict:
     """Detect retraction / erratum / expression-of-concern status.
 
     ``comments`` accepts the EuropePMC commentCorrectionList types.
+    EuropePMC labels the *affected* record with the 'X in' variants
+    ('Retraction in', 'Expression of Concern in', 'Erratum in',
+    'Correction in'), so the trailing ' in' is normalized before matching -
+    exact matching alone misses real retractions.
     """
     pts = {str(p).strip().lower() for p in (pub_types or [])}
     types = {str(c).strip().lower() for c in (comments or [])}
+    norm = {t[:-3].strip() if t.endswith(" in") else t for t in types}
     flags: dict = {}
-    if pts & _RETRACT_PT or "retraction" in types or "retraction of publication" in types:
+    if pts & _RETRACT_PT or norm & {"retraction", "retraction of publication"}:
         flags["retracted"] = True
-    if pts & _CONCERN_PT or "expression of concern" in types:
+    if pts & _CONCERN_PT or "expression of concern" in norm:
         flags["expression_of_concern"] = True
-    if pts & _ERRATUM_PT or "erratum" in types or "correction" in types:
+    if pts & _ERRATUM_PT or norm & {"erratum", "correction"}:
         flags["corrected"] = True
     return flags
 
