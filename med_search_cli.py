@@ -56,7 +56,9 @@ _latency = {
 }
 
 # Background executor for stale-cache refresh (daemon threads, torn down at exit)
-_bg_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bgcache")
+# NOTE (2026-10-26 fix): stale-cache refresh is now synchronous inside
+# _fetch_one_pmid (see _refresh_cache); the old background executor was
+# removed because its refresh usually died at process exit.
 
 # ---------------------------------------------------------------------------
 # Query utilities
@@ -1142,55 +1144,80 @@ def _enrich_search_result(record: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Background cache refresh
 # ---------------------------------------------------------------------------
-def _refresh_cache(pmid: str, ttl: int) -> None:
-    """Fetch fresh metadata + fulltext and overwrite cache entry."""
+def _fetch_fresh_record(pmid: str) -> tuple[dict, str] | None:
+    """Build a fresh (uncached) record for a PMID, without saving it.
+
+    Shared by the cold-fetch path and the synchronous stale refresh, so
+    both produce the same record shape (the old _refresh_cache built a
+    smaller record missing date/commentary/pub_types).
+
+    Full-text source priority is deterministic and shared with the Rust
+    port (2026-10-26 fix): PubMed first (>=200 chars of body), then
+    EuropePMC, then Unpaywall. The previous code ran the two full-text
+    fetches in parallel and took the first finisher, so `source` was
+    nondeterministic when both sources had the paper. Returns None iff
+    metadata cannot be fetched.
+    """
     meta = pmid_metadata(pmid)
     if not meta:
-        return
+        return None
     doi = meta["doi"]
     out = {
         "pmid": pmid,
         "doi": doi,
         "title": meta["title"],
         "abstract": meta["abstract"],
+        "date": meta.get("date"),
         "study_type": meta.get("study_type", "Unknown"),
+        "commentary": meta.get("commentary", False),
         "sections": None,
         "open_access": None,
         "proxy_url": None,
         "journal": meta.get("journal"),
         "authors": meta.get("authors", []),
         "mesh_keywords": meta.get("mesh_keywords", []),
+        "pub_types": meta.get("pub_types", []),
     }
+    for flag in ("retracted", "expression_of_concern", "corrected"):
+        if meta.get(flag):
+            out[flag] = True
     source = "fallback"
-
-    tasks = {
-        "pubmed": lambda: fetch_pubmed_fulltext(pmid),
-        "europepmc": lambda: fetch_europepmc_fulltext(pmid),
-    }
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        futures = {ex.submit(func): name for name, func in tasks.items()}
-        for f in as_completed(futures):
-            name = futures[f]
-            try:
-                res = f.result()
-                if res and res.get("sections"):
-                    out["sections"] = res["sections"]
-                    source = f"{name}_ft"
-                    break
-            except Exception:
-                continue
-
+    for name, func in (("pubmed", fetch_pubmed_fulltext),
+                       ("europepmc", fetch_europepmc_fulltext)):
+        try:
+            res = func(pmid)
+        except Exception:
+            continue
+        secs = (res or {}).get("sections") or {}
+        body_len = sum(len(v) for v in secs.values() if isinstance(v, str))
+        if body_len >= 200:
+            out["sections"] = secs
+            source = f"{name}_ft"
+            break
     if source == "fallback" and doi:
         oa = fetch_unpaywall(doi)
         if oa:
             out["open_access"] = oa
             source = "unpaywall"
-
     proxy_prefix = os.getenv("INSTITUTIONAL_PROXY_PREFIX")
     if doi and proxy_prefix:
         out["proxy_url"] = f"{proxy_prefix}{urllib.parse.quote(f'https://doi.org/{doi}')}"
+    return out, source
 
+
+def _refresh_cache(pmid: str, ttl: int) -> bool:
+    """Synchronously fetch fresh metadata + fulltext and overwrite the
+    cache entry. Returns True on success (metadata fetched), False
+    otherwise. Previously this was submitted to a background executor
+    that usually died at process exit, so stale entries were rarely
+    actually refreshed; callers now use the return value to decide
+    whether the stale record or the fresh one is returned."""
+    fresh = _fetch_fresh_record(pmid)
+    if fresh is None:
+        return False
+    out, source = fresh
     save_to_cache(pmid, source, out, ttl)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1213,70 +1240,31 @@ def _fetch_one_pmid(pmid: str, section: str, limit: int, ttl: int) -> dict:
                 out.setdefault("commentary", meta.get("commentary", False))
                 save_to_cache(pmid, source, out, ttl)
     elif cached and cached["stale"]:
-        out = cached["data"]
-        source = cached["source"]
-        out["cached_stale"] = True
-        _bg_executor.submit(_refresh_cache, pmid, ttl)
+        # Stale contract (shared with the Rust port since the 2026-10-26
+        # fix): attempt a SYNCHRONOUS refresh before returning. On
+        # success the fresh record is returned with refreshed=True and
+        # re-cached; on failure the stale record is returned with
+        # cached_stale=True. No background thread that dies at exit.
+        if _refresh_cache(pmid, ttl):
+            refreshed = get_cached_data(pmid)
+            if refreshed and not refreshed["stale"]:
+                out = refreshed["data"]
+                source = refreshed["source"]
+                out["refreshed"] = True
+            else:
+                out = cached["data"]
+                source = cached["source"]
+                out["cached_stale"] = True
+        else:
+            out = cached["data"]
+            source = cached["source"]
+            out["cached_stale"] = True
     else:
-        meta = pmid_metadata(pmid)
-        if not meta:
+        fresh = _fetch_fresh_record(pmid)
+        if fresh is None:
             return {"error": f"No PubMed record found for PMID {pmid} "
                              f"(invalid or deleted).", "pmid": pmid}
-
-        doi = meta["doi"]
-        out = {
-            "pmid": pmid,
-            "doi": doi,
-            "title": meta["title"],
-            "abstract": meta["abstract"],
-            "date": meta.get("date"),
-            "study_type": meta.get("study_type", "Unknown"),
-            "commentary": meta.get("commentary", False),
-            "sections": None,
-            "open_access": None,
-            "proxy_url": None,
-            "journal": meta.get("journal"),
-            "authors": meta.get("authors", []),
-            "mesh_keywords": meta.get("mesh_keywords", []),
-            "pub_types": meta.get("pub_types", []),
-        }
-        for flag in ("retracted", "expression_of_concern", "corrected"):
-            if meta.get(flag):
-                out[flag] = True
-        source = "fallback"
-
-        tasks = {
-            "pubmed": lambda: fetch_pubmed_fulltext(pmid),
-            "europepmc": lambda: fetch_europepmc_fulltext(pmid),
-        }
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            futures = {ex.submit(func): name for name, func in tasks.items()}
-            for f in as_completed(futures):
-                name = futures[f]
-                try:
-                    res = f.result()
-                    # A section index that exists but holds no usable text must
-                    # not be reported as a full-text hit (that produced
-                    # source=europepmc_ft with an empty body).
-                    secs = (res or {}).get("sections") or {}
-                    body_len = sum(len(v) for v in secs.values() if isinstance(v, str))
-                    if body_len >= 200:
-                        out["sections"] = secs
-                        source = f"{name}_ft"
-                        break
-                except Exception:
-                    continue
-
-        if source == "fallback" and doi:
-            oa = fetch_unpaywall(doi)
-            if oa:
-                out["open_access"] = oa
-                source = "unpaywall"
-
-        proxy_prefix = os.getenv("INSTITUTIONAL_PROXY_PREFIX")
-        if doi and proxy_prefix:
-            out["proxy_url"] = f"{proxy_prefix}{urllib.parse.quote(f'https://doi.org/{doi}')}"
-
+        out, source = fresh
         save_to_cache(pmid, source, out, ttl)
 
     # Build response
@@ -1298,7 +1286,7 @@ def _fetch_one_pmid(pmid: str, section: str, limit: int, ttl: int) -> dict:
     if out.get("commentary"):
         resp["note"] = "Editorial/letter/commentary — no abstract available"
     for optional in ("doi", "journal", "authors", "mesh_keywords", "proxy_url",
-                     "pub_types", "cached", "cached_stale"):
+                     "pub_types", "cached", "cached_stale", "refreshed"):
         if out.get(optional):
             resp[optional] = out[optional]
 
